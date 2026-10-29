@@ -62,6 +62,15 @@ jobs:
           grep -rlE "$PATTERN" HiFidelity --include=*.swift | grep -v OnChangeCompat.swift | xargs sed -i '' -E "/$PATTERN/ s/\.onChange\(/.onChangeCompat(/"
           echo "Two-parameter onChange after: $(grep -rE "$PATTERN" HiFidelity --include=*.swift | wc -l)"
 
+      # 2b) The app also uses the macOS-14-only onChange directly on the window (Scene).
+      #     Move it inside the window's content, where the macOS 13 version works.
+      - name: Patch scene-level onChange
+        run: |
+          perl -0pi -e 's/\n\s*\.onChangeCompat\(of: scenePhase\) \{ oldPhase, newPhase in\s*handleScenePhaseChange\(newPhase\)\s*\}//' HiFidelity/HiFidelityApp.swift
+          perl -0pi -e 's/(\.themedAccentColor\(appTheme\))/$1\n                .onChange(of: scenePhase) { newPhase in handleScenePhaseChange(newPhase) }/' HiFidelity/HiFidelityApp.swift
+          sed -n 24,36p HiFidelity/HiFidelityApp.swift
+          grep -n "onChange" HiFidelity/HiFidelityApp.swift
+
       # 3) The bundled TagLib library was built for macOS 15, so rebuild it for macOS 13 + Intel
       - name: Build TagLib for macOS 13 (Intel)
         run: |
