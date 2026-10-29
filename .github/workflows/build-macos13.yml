@@ -1,0 +1,128 @@
+# Builds HiFidelity for Intel Macs running macOS 13 (Ventura).
+# Run it manually from the "Actions" tab. The result is a downloadable .zip.
+name: Build HiFidelity for macOS 13 (Intel)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Download the source code
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      # 1) Lower the minimum macOS version from 14 to 13
+      - name: Patch deployment target
+        run: |
+          sed -i '' -E 's/MACOSX_DEPLOYMENT_TARGET = 14\.[0-9]+;/MACOSX_DEPLOYMENT_TARGET = 13.0;/g' HiFidelity.xcodeproj/project.pbxproj
+          grep -n "MACOSX_DEPLOYMENT_TARGET" HiFidelity.xcodeproj/project.pbxproj
+
+      # 2) Replace the macOS-14-only form of .onChange { old, new in } with a compatible helper
+      - name: Patch onChange for macOS 13
+        run: |
+          cat > HiFidelity/Utils/OnChangeCompat.swift <<'EOF'
+          import SwiftUI
+
+          private struct OnChangeCompat<V: Equatable>: ViewModifier {
+              let value: V
+              let action: (V, V) -> Void
+              @State private var old: V
+
+              init(value: V, action: @escaping (V, V) -> Void) {
+                  self.value = value
+                  self.action = action
+                  _old = State(initialValue: value)
+              }
+
+              func body(content: Content) -> some View {
+                  content.onChange(of: value) { new in
+                      action(old, new)
+                      old = new
+                  }
+              }
+          }
+
+          extension View {
+              func onChangeCompat<V: Equatable>(of value: V, _ action: @escaping (V, V) -> Void) -> some View {
+                  modifier(OnChangeCompat(value: value, action: action))
+              }
+          }
+          EOF
+
+          PATTERN='\.onChange\(of:.*\) *\{ *(_|[a-zA-Z]+), *(_|[a-zA-Z]+) in'
+          echo "Two-parameter onChange before: $(grep -rE "$PATTERN" HiFidelity --include=*.swift | wc -l)"
+          grep -rlE "$PATTERN" HiFidelity --include=*.swift | grep -v OnChangeCompat.swift | xargs sed -i '' -E "/$PATTERN/ s/\.onChange\(/.onChangeCompat(/"
+          echo "Two-parameter onChange after: $(grep -rE "$PATTERN" HiFidelity --include=*.swift | wc -l)"
+
+      # 3) The bundled TagLib library was built for macOS 15, so rebuild it for macOS 13 + Intel
+      - name: Build TagLib for macOS 13 (Intel)
+        run: |
+          git clone --depth 1 --branch v2.1.1 --recurse-submodules https://github.com/taglib/taglib.git /tmp/taglib
+          cmake -S /tmp/taglib -B /tmp/taglib/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_EXAMPLES=OFF \
+            -DBUILD_BINDINGS=OFF \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+          cmake --build /tmp/taglib/build --parallel
+          REAL=$(find /tmp/taglib/build -name 'libtag.*.*.*.dylib' -type f | head -1)
+          echo "Built: $REAL"
+          cp "$REAL" HiFidelity/deps/lib/libtag.2.dylib
+          install_name_tool -id @rpath/libtag.2.dylib HiFidelity/deps/lib/libtag.2.dylib
+          lipo -info HiFidelity/deps/lib/libtag.2.dylib
+          otool -l HiFidelity/deps/lib/libtag.2.dylib | grep -A4 LC_BUILD_VERSION
+
+      # 4) Build the app (Intel only, ad-hoc signed, no Apple developer account needed)
+      - name: Build HiFidelity
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project HiFidelity.xcodeproj \
+            -scheme HiFidelity \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath build \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            ARCHS=x86_64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            ENABLE_HARDENED_RUNTIME=NO \
+            build 2>&1 | tee build.log
+
+      - name: Check the result
+        run: |
+          APP="build/Build/Products/Release/HiFidelity.app"
+          lipo -archs "$APP/Contents/MacOS/HiFidelity"
+          vtool -show-build "$APP/Contents/MacOS/HiFidelity" | grep -E "minos|platform"
+          ls "$APP/Contents/Frameworks" || true
+
+      - name: Zip the app
+        run: |
+          ditto -c -k --keepParent build/Build/Products/Release/HiFidelity.app HiFidelity-macOS13-intel.zip
+
+      - name: Upload the app
+        uses: actions/upload-artifact@v4
+        with:
+          name: HiFidelity-macOS13-intel
+          path: HiFidelity-macOS13-intel.zip
+
+      - name: Upload the build log (to help troubleshooting)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
